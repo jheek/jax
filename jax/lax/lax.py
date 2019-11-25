@@ -426,7 +426,8 @@ Precision.__str__ = lambda precision: precision.name
 
 def conv_general_dilated(lhs, rhs, window_strides, padding, lhs_dilation=None,
                          rhs_dilation=None, dimension_numbers=None,
-                         feature_group_count=1, precision=None):
+                         feature_group_count=1, batch_group_count=1,
+                         precision=None):
   """General n-dimensional convolution operator, with optional dilation.
 
   Wraps XLA's `Conv
@@ -498,6 +499,7 @@ def conv_general_dilated(lhs, rhs, window_strides, padding, lhs_dilation=None,
       lhs_dilation=tuple(lhs_dilation), rhs_dilation=tuple(rhs_dilation),
       dimension_numbers=dimension_numbers,
       feature_group_count=feature_group_count,
+      batch_group_count=batch_group_count,
       lhs_shape=lhs.shape, rhs_shape=rhs.shape,
       precision=_canonicalize_precision(precision))
 
@@ -1905,12 +1907,20 @@ masking.defvectorized(bitcast_convert_type_p)
 
 def _conv_general_dilated_shape_rule(
     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
-    dimension_numbers, feature_group_count, **unused_kwargs):
+    dimension_numbers, feature_group_count, batch_group_count, **unused_kwargs):
   assert type(dimension_numbers) is ConvDimensionNumbers
   if not feature_group_count > 0:
     msg = ("conv_general_dilated feature_group_count "
            "must be a positive integer, got {}.")
     raise ValueError(msg.format(feature_group_count))
+  if not batch_group_count > 0:
+    msg = ("conv_general_dilated batch_group_count "
+           "must be a positive integer, got {}.")
+    raise ValueError(msg.format(batch_group_count))
+  if feature_group_count > 1 and batch_group_count > 1:
+    msg = ("conv_general_dilated feature_group_count and batch_group_count "
+           "cannot both be greater than one, got {} and {}.")
+    raise ValueError(msg.format(feature_group_count, batch_group_count))
   lhs_feature_count = lhs.shape[dimension_numbers.lhs_spec[1]]
   quot, rem = divmod(lhs_feature_count, feature_group_count)
   if rem:
@@ -1928,10 +1938,21 @@ def _conv_general_dilated_shape_rule(
            "multiple of feature_group_count, but {} is not a multiple of {}.")
     raise ValueError(msg.format(rhs.shape[dimension_numbers.rhs_spec[0]],
                                 feature_group_count))
+  if rhs.shape[dimension_numbers.rhs_spec[0]] % feature_group_count:
+    msg = ("conv_general_dilated rhs output feature dimension size must be a "
+           "multiple of feature_group_count, but {} is not a multiple of {}.")
+    raise ValueError(msg.format(rhs.shape[dimension_numbers.rhs_spec[0]],
+                                feature_group_count))
+  if lhs.shape[dimension_numbers.lhs_spec[0]] != batch_group_count and batch_group_count > 1:
+    msg = ("conv_general_dilated lhs feature dimension size must be the same "
+           "as batch_group_count, but {} != {}.")
+    raise ValueError(msg.format(lhs.shape[dimension_numbers.lhs_spec[0]],
+                                batch_group_count))
+  
   lhs_perm, rhs_perm, out_perm = dimension_numbers
   lhs_trans = _dilate_shape(onp.take(lhs.shape, lhs_perm), lhs_dilation)
   rhs_trans = _dilate_shape(onp.take(rhs.shape, rhs_perm), rhs_dilation)
-  out_trans = conv_shape_tuple(lhs_trans, rhs_trans, window_strides, padding)
+  out_trans = conv_shape_tuple(lhs_trans, rhs_trans, window_strides, padding, batch_group_count)
   return tuple(onp.take(out_trans, onp.argsort(out_perm)))
 
 def _conv_general_dilated_dtype_rule(
@@ -1945,7 +1966,7 @@ _conv_sdims = lambda spec: spec[2:]
 
 def _conv_general_dilated_transpose_lhs(
     g, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
-    dimension_numbers, feature_group_count,
+    dimension_numbers, feature_group_count, batch_group_count,
     lhs_shape, rhs_shape, precision):
   assert type(dimension_numbers) is ConvDimensionNumbers
   lhs_sdims, rhs_sdims, out_sdims = map(_conv_sdims, dimension_numbers)
@@ -1966,17 +1987,24 @@ def _conv_general_dilated_transpose_lhs(
       g, revd_weights, window_strides=lhs_dilation, padding=padding,
       lhs_dilation=window_strides, rhs_dilation=rhs_dilation,
       dimension_numbers=trans_dimension_numbers,
-      feature_group_count=feature_group_count, precision=precision)
+      feature_group_count=feature_group_count,
+      batch_group_count=batch_group_count,
+      precision=precision)
 
 def _conv_general_dilated_transpose_rhs(
     g, lhs, window_strides, padding, lhs_dilation, rhs_dilation,
-    dimension_numbers, feature_group_count,
+    dimension_numbers, feature_group_count, batch_group_count,
     lhs_shape, rhs_shape, precision):
   assert type(dimension_numbers) is ConvDimensionNumbers
 
   lhs_sdims, rhs_sdims, out_sdims = map(_conv_sdims, dimension_numbers)
   lhs_trans, rhs_trans, out_trans = map(_conv_spec_transpose, dimension_numbers)
-  if feature_group_count > 1:
+  lhs_features = lhs.shape[lhs_trans[0]]
+  out_features = g.shape[out_trans[0]]
+  is_depthwise = feature_group_count == lhs_features and feature_group_count == out_features
+  if is_depthwise or batch_group_count > 1:
+    feature_group_count, batch_group_count = batch_group_count, feature_group_count
+  elif feature_group_count > 1:
     lhs = _reshape_axis_out_of(lhs_trans[0], feature_group_count, lhs)
     lhs = _reshape_axis_into(lhs_trans[0], lhs_trans[1], lhs)
   trans_dimension_numbers = ConvDimensionNumbers(lhs_trans, out_trans, rhs_trans)
@@ -1988,22 +2016,24 @@ def _conv_general_dilated_transpose_rhs(
       lhs, g, window_strides=rhs_dilation, padding=padding,
       lhs_dilation=lhs_dilation, rhs_dilation=window_strides,
       dimension_numbers=trans_dimension_numbers,
-      feature_group_count=feature_group_count, precision=precision)
+      feature_group_count=feature_group_count,
+      batch_group_count=batch_group_count,
+      precision=precision)
 
 def _conv_general_dilated_translation_rule(
     c, lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
-    dimension_numbers, feature_group_count, precision, **unused_kwargs):
+    dimension_numbers, feature_group_count, batch_group_count, precision, **unused_kwargs):
   assert type(dimension_numbers) is ConvDimensionNumbers
   dimension_numbers = _conv_general_proto(dimension_numbers)
   return c.ConvGeneralDilated(lhs, rhs, window_strides, padding, lhs_dilation,
                               rhs_dilation, dimension_numbers,
-                              feature_group_count,
+                              feature_group_count, batch_group_count,
                               precision_config=_precision_config(precision))
 
 def _conv_general_dilated_batch_rule(
     batched_args, batch_dims, window_strides, padding,
     lhs_dilation, rhs_dilation, dimension_numbers,
-    feature_group_count, precision, **unused_kwargs):
+    feature_group_count, batch_group_count, precision, **unused_kwargs):
   lhs, rhs = batched_args
   lhs_bdim, rhs_bdim = batch_dims
   lhs_spec, rhs_spec, out_spec = dimension_numbers
@@ -4297,7 +4327,7 @@ def _check_conv_shapes(name, lhs_shape, rhs_shape, window_strides):
     raise TypeError(msg.format(name, expected_length, len(window_strides)))
 
 
-def conv_shape_tuple(lhs_shape, rhs_shape, strides, pads):
+def conv_shape_tuple(lhs_shape, rhs_shape, strides, pads, batch_group_count=1):
   """Compute the shape tuple of a conv given input shapes in canonical order."""
   if isinstance(pads, str):
     pads = padtype_to_pads(lhs_shape[2:], rhs_shape[2:], strides, pads)
@@ -4309,7 +4339,7 @@ def conv_shape_tuple(lhs_shape, rhs_shape, strides, pads):
   out_space = onp.floor_divide(
       onp.subtract(lhs_padded, rhs_shape[2:]), strides) + 1
   out_space = onp.maximum(0, out_space)
-  out_shape = (lhs_shape[0], rhs_shape[0]) + tuple(out_space)
+  out_shape = (lhs_shape[0] // batch_group_count, rhs_shape[0]) + tuple(out_space)
   return tuple(out_shape)
 
 
