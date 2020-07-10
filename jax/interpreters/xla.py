@@ -1261,11 +1261,11 @@ parallel_translations[core.axis_index_p] = _axis_index_translation_rule
 
 
 def _call_translation_rule(c, axis_env, in_nodes, name_stack,
-                           *, backend, call_jaxpr):
-  subc = xb.make_computation_builder("core_call")
+                           *, name='core_call', backend, call_jaxpr):
+  subc = xb.make_computation_builder(name)
   args = [xb.parameter(subc, i, c.GetShape(n)) for i, n in enumerate(in_nodes)]
   out_nodes = jaxpr_subcomp(subc, call_jaxpr, backend, axis_env, (),
-                            extend_name_stack(name_stack, 'core_call'), *args)
+                            extend_name_stack(name_stack, name), *args)
   subc = subc.Build(xops.Tuple(subc, out_nodes))
   return xops.Call(c, subc, list(in_nodes))
 call_translations[core.call_p] = _call_translation_rule
